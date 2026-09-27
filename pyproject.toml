@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nfcheck"
+version = "0.1.0"
+description = "Prove or disprove 'no functional change' claims in git history by comparing compiled Python."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.scripts]
+nfcheck = "nfcheck.cli:run"
+
+[tool.setuptools]
+packages = ["nfcheck"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
