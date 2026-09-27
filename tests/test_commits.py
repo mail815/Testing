@@ -57,6 +57,10 @@ def by_subject(out):
     ("Run isort", True),
     ("refactor: split module", False),
     ("Refactored the cache", False),
+    ("Don't touch parser (NFC)", True),                    # apostrophe is not a quote
+    ("Tidy 'utils' module, no functional change", True),   # quote closed before claim
+    ("Tidy parser\n\nNFC.", True),                          # tag on its own line
+    ("Tidy parser\n\nThis is (NFCI) as far as I know", True),
 ])
 def test_claims_detected(msg, strong):
     c = claims_no_change(msg)
@@ -69,6 +73,10 @@ def test_claims_detected(msg, strong):
     "Add NFC reader support".replace("NFC", "nfcpy"),
     "Improve tests\n\nRefactored assoc helper",  # "refactor" only counts in subject
     "Merge pull request #1 from x/refactor-y",
+    "Add checker for 'no functional change' claims",       # a mention, not a claim
+    'Detect "NFC" commits that lie',
+    "Explain `NFC` in the docs",
+    "Add checker\n\nStrong claims (NFC, reformat, style:) are checked.",
 ])
 def test_non_claims_ignored(msg):
     assert claims_no_change(msg) is None

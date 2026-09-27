@@ -16,14 +16,17 @@ from .fingerprint import (Fingerprint, Quick, Unparseable, code_units, fingerpri
 from .git import EMPTY, Change, Commit, Repo
 
 # EXPLICIT claims may appear anywhere in the message: they are unambiguous.
+# A bare "NFC" counts only in the subject, as a tag ("[NFC]", "(NFC)") or on
+# a line of its own: in prose it is usually a mention ("claims like NFC, ...").
+NFC_SUBJECT = re.compile(r"\bNFCI?\b")
 EXPLICIT = re.compile(
     r"""
-    \[NFCI?\] | \bNFCI?\b
+    \[NFCI?\] | \(NFCI?\) | ^\s*NFCI?[.!]?\s*$
     | \bno[ -]functional[ -]changes?\b
     | \bno[ -](?:behaviou?ral|behaviou?r|logic|semantic)[ -]changes?\b
     | \bbehaviou?r[ -]preserving\b
     | \bpure[ -]refactor(?:ing)?\b
-    """, re.IGNORECASE | re.VERBOSE)
+    """, re.IGNORECASE | re.VERBOSE | re.MULTILINE)
 # FORMATTING claims only count in the subject line, in unambiguous forms.
 # ("Format X" is excluded: in a formatter's own repo it describes a feature.)
 FORMATTING = re.compile(
@@ -54,9 +57,34 @@ class Claim:
     strong: bool
 
 
+_OPEN_SINGLE = re.compile(r"(?:^|(?<=\s))['\u2018](?=\S)")
+_CLOSE_SINGLE = re.compile(r"(?<=\S)['\u2019](?=\s|$|[.,;:!?)])")
+
+
+def _quoted(text: str, start: int) -> bool:
+    """True if position ``start`` is inside quotes on its line: a mention
+    (e.g. 'adds a checker for "NFC" claims') rather than a claim."""
+    line_start = text.rfind("\n", 0, start) + 1
+    before = text[line_start:start]
+    if before.count('"') % 2 or before.count("`") % 2:
+        return True
+    if before.count("\u201c") > before.count("\u201d"):
+        return True
+    # Single quotes double as apostrophes ("don't"), so only count quotes
+    # that open before a word and close after one.
+    opened = len(_OPEN_SINGLE.findall(text[line_start:start + 1]))
+    return opened > len(_CLOSE_SINGLE.findall(before))
+
+
 def claims_no_change(message: str) -> Claim | None:
     subject = message.strip().splitlines()[0] if message.strip() else ""
-    if m := EXPLICIT.search(message) or FORMATTING.search(subject):
+    for m in EXPLICIT.finditer(message):
+        if not _quoted(message, m.start()):
+            return Claim(m.group(0).strip(), True)
+    for m in NFC_SUBJECT.finditer(subject):
+        if not _quoted(subject, m.start()):
+            return Claim(m.group(0), True)
+    if m := FORMATTING.search(subject):
         return Claim(m.group(0).strip(), True)
     if m := WEAK.search(subject):
         return Claim(m.group(0).strip(), False)
