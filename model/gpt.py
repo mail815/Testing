@@ -30,6 +30,20 @@ class GPTConfig:
     dropout: float = 0.0
 
 
+PRESETS: dict[str, dict] = {
+    # Shapes only. Parameter counts are approximate; compute and data decide quality.
+    "tiny": dict(dim=128, n_layers=4, n_heads=4, n_kv_heads=2, context=256),
+    "small": dict(dim=512, n_layers=8, n_heads=8, n_kv_heads=2, context=1024),
+    "1b": dict(dim=2048, n_layers=22, n_heads=32, n_kv_heads=8, context=4096),
+    "8b": dict(dim=4096, n_layers=32, n_heads=32, n_kv_heads=8, context=8192,
+               rope_base=500_000.0),
+}
+
+
+def preset(name: str, vocab_size: int = 256) -> GPTConfig:
+    return GPTConfig(vocab_size=vocab_size, **PRESETS[name])
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -46,10 +60,11 @@ def rope_tables(head_dim: int, length: int, base: float) -> tuple[torch.Tensor, 
     return freqs.cos(), freqs.sin()
 
 
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+               start: int = 0) -> torch.Tensor:
     x1, x2 = x[..., 0::2], x[..., 1::2]
     T = x.shape[-2]
-    c, s = cos[:T], sin[:T]
+    c, s = cos[start:start + T], sin[start:start + T]
     return torch.stack((x1 * c - x2 * s, x1 * s + x2 * c), dim=-1).flatten(-2)
 
 
@@ -64,16 +79,23 @@ class Attention(nn.Module):
         self.o = nn.Linear(cfg.dim, cfg.dim, bias=False)
         self.dropout = cfg.dropout
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, cos, sin, cache=None, start=0):
         B, T, _ = x.shape
         q = self.q(x).view(B, T, self.h, self.hd).transpose(1, 2)
         k, v = self.kv(x).view(B, T, 2, self.kvh, self.hd).unbind(2)
         k, v = k.transpose(1, 2), v.transpose(1, 2)
-        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        q, k = apply_rope(q, cos, sin, start), apply_rope(k, cos, sin, start)
+        if cache is not None:  # KV cache stores the compact (un-repeated) GQA heads
+            if cache:
+                k = torch.cat([cache[0], k], 2)
+                v = torch.cat([cache[1], v], 2)
+            cache[:] = [k, v]
         rep = self.h // self.kvh
         k, v = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
+        # Causal masking is only needed when queries span several positions.
         y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0)
+            q, k, v, is_causal=T > 1 and start == 0,
+            dropout_p=self.dropout if self.training else 0.0)
         return self.o(y.transpose(1, 2).reshape(B, T, -1))
 
 
@@ -96,8 +118,8 @@ class Block(nn.Module):
         self.n1, self.attn = RMSNorm(cfg.dim), Attention(cfg)
         self.n2, self.ffn = RMSNorm(cfg.dim), SwiGLU(cfg)
 
-    def forward(self, x, cos, sin):
-        x = x + self.attn(self.n1(x), cos, sin)
+    def forward(self, x, cos, sin, cache=None, start=0):
+        x = x + self.attn(self.n1(x), cos, sin, cache, start)
         return x + self.ffn(self.n2(x))
 
 
@@ -123,10 +145,10 @@ class GPT(nn.Module):
         if isinstance(m, (nn.Linear, nn.Embedding)):
             nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, cache=None, start=0):
         x = self.embed(idx)
-        for b in self.blocks:
-            x = b(x, self.cos, self.sin)
+        for i, b in enumerate(self.blocks):
+            x = b(x, self.cos, self.sin, None if cache is None else cache[i], start)
         logits = self.head(self.norm(x))
         loss = None
         if targets is not None:
@@ -137,11 +159,22 @@ class GPT(nn.Module):
     def generate(self, idx, max_new_tokens: int, temperature: float = 0.8,
                  top_k: int | None = 50,
                  should_stop: Callable[[], bool] = lambda: False):
-        """Sample tokens; checks ``should_stop`` (the kill switch) every token."""
+        """Sample tokens with a KV cache; checks ``should_stop`` every token."""
+        cache, pos = None, 0
         for _ in range(max_new_tokens):
             if should_stop():
                 break
-            logits, _ = self(idx[:, -self.cfg.context:])
+            if cache is None or pos >= self.cfg.context:
+                # (Re)fill the cache. On overflow keep half the window so the
+                # refill cost is amortized over context/2 cheap cached steps.
+                window = idx[:, -(self.cfg.context // 2):] if cache is not None \
+                    else idx[:, -self.cfg.context:]
+                cache = [[] for _ in self.blocks]
+                logits, _ = self(window, cache=cache, start=0)
+                pos = window.size(1)
+            else:
+                logits, _ = self(idx[:, -1:], cache=cache, start=pos)
+                pos += 1
             logits = logits[:, -1] / max(temperature, 1e-5)
             if top_k:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))

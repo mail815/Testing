@@ -17,24 +17,30 @@ a hosted API, in `ContainedModel`.
 ## Layout
 
 ```
-model/gpt.py      Decoder-only transformer: RMSNorm, RoPE, GQA, SwiGLU, tied embeddings
-guardian/         Containment runtime (standard library only)
-  killswitch.py   Latched kill switch, halt file, dead-man's switch
-  quorum.py       M-of-N signed, single-use, expiring operator approvals
-  policy.py       Default-deny tool tiers, budgets, output tripwires
-  sandbox.py      Resource-limited subprocess execution for tools
-  audit.py        Hash-chained append-only audit log
+model/
+  gpt.py          Transformer: RMSNorm, RoPE, GQA, SwiGLU, KV cache, size presets
+  checkpoint.py   Safe save/load (no pickle code execution), gated serving
+  evals.py        Pre-deployment evaluation report
+guardian/         Containment runtime (depends only on `cryptography`)
+  killswitch.py   Persistent latched kill switch, halt file, signed dead-man's switch, watchdog
+  quorum.py       M-of-N Ed25519 approvals: single-use, expiring, replay-proof
+  policy.py       Default-deny tools, budgets, rate limits, obfuscation-aware tripwires, monitors
+  preflight.py    Self-test of the live configuration; serving refused until it passes
+  deploy.py       Deployment gate: only approved, eval-passing weights are served
+  sandbox.py      Resource-limited, output-capped subprocess execution
+  audit.py        Hash-chained audit log with external anchoring
   runtime.py      ContainedModel: the only path from model to world
-train.py          Training loop under the kill switch (touch HALT to stop)
+  cli.py          Operator tool: keygen, sign, halt, verify-audit
+train.py          Training under the kill switch, ending in an eval report
 demo.py           End-to-end walkthrough of every control
-docs/SAFETY.md    Threat model, required deployment layers, limitations
+docs/             SAFETY, RISK_REGISTER, OPERATIONS, UPDATES
 ```
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q               # 21 tests
+python -m pytest -q               # 48 tests
 python demo.py                    # see each control in action
 python train.py --data input.txt  # touch HALT to stop training at any point
 ```
@@ -51,5 +57,10 @@ python train.py --data input.txt  # touch HALT to stop training at any point
   need two or more grown-ups to sign off.
 - **The diary** (`audit.py`): everything goes in a diary where ripping out or
   changing a page is always noticed.
+- **The report card and sign-off** (`evals.py`, `deploy.py`): a new brain has
+  to pass its tests, and grown-ups have to sign for that exact brain, before it
+  can be used.
+- **The pre-flight check** (`preflight.py`): before starting, the system
+  checks that its own safety features work, and refuses to start if not.
 
-Read `docs/SAFETY.md` before deploying anything.
+Read `docs/SAFETY.md` and `docs/RISK_REGISTER.md` before deploying anything.

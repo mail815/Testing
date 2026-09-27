@@ -15,7 +15,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 GENESIS = "0" * 64
 
@@ -42,9 +42,13 @@ class AuditRecord:
 class AuditLog:
     """Hash-chained JSONL log. Thread-safe; fsyncs every write."""
 
-    def __init__(self, path: str | os.PathLike[str]):
+    def __init__(self, path: str | os.PathLike[str],
+                 anchor_sink: Callable[[int, str], None] | None = None,
+                 anchor_every: int = 100):
         self.path = os.fspath(path)
-        self._lock = threading.Lock()
+        self._sink = anchor_sink
+        self._anchor_every = anchor_every
+        self._lock = threading.RLock()
         self._seq = 0
         self._head = GENESIS
         if os.path.exists(self.path):
@@ -72,7 +76,22 @@ class AuditLog:
                 os.fsync(f.fileno())
             self._seq += 1
             self._head = h
+            if self._sink and self._seq % self._anchor_every == 0:
+                self.anchor()
             return AuditRecord(hash=h, **unsigned)
+
+    def anchor(self) -> tuple[int, str]:
+        """Publish (record count, head hash) to the external sink.
+
+        A hash chain alone cannot detect deletion of the *newest* records.
+        Comparing against an anchor held elsewhere (write-once storage, a
+        separate operator machine) can.
+        """
+        with self._lock:
+            point = (self._seq, self._head)
+        if self._sink:
+            self._sink(*point)
+        return point
 
     def records(self) -> Iterator[dict[str, Any]]:
         if not os.path.exists(self.path):
@@ -80,10 +99,17 @@ class AuditLog:
         with open(self.path, encoding="utf-8") as f:
             for line in f:
                 if line.strip():
-                    yield json.loads(line)
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError as e:
+                        raise AuditIntegrityError(f"corrupt record: {e}") from e
 
-    def verify(self) -> list[AuditRecord]:
-        """Re-walk the whole chain. Raises AuditIntegrityError on any tampering."""
+    def verify(self, anchor: tuple[int, str] | None = None) -> list[AuditRecord]:
+        """Re-walk the whole chain. Raises AuditIntegrityError on any tampering.
+
+        With ``anchor=(count, head)`` from :meth:`anchor`, also detects
+        truncation of records written before that anchor.
+        """
         prev, out = GENESIS, []
         for i, raw in enumerate(self.records()):
             claimed = raw.pop("hash", None)
@@ -93,6 +119,15 @@ class AuditLog:
                 raise AuditIntegrityError(f"record {i}: broken chain link")
             if _digest(raw) != claimed:
                 raise AuditIntegrityError(f"record {i}: content hash mismatch")
+            if set(raw) != {"seq", "ts", "event", "data", "prev"}:
+                raise AuditIntegrityError(f"record {i}: unexpected fields")
             out.append(AuditRecord(hash=claimed, **raw))
             prev = claimed
+        if anchor is not None:
+            count, head = anchor
+            if len(out) < count:
+                raise AuditIntegrityError(
+                    f"log truncated: {len(out)} records, anchor says {count}")
+            if count and out[count - 1].hash != head:
+                raise AuditIntegrityError("log diverges from anchor")
         return out

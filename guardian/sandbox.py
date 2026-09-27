@@ -38,6 +38,7 @@ def _limits(cpu_s: int, mem_bytes: int, max_file: int):
         resource.setrlimit(resource.RLIMIT_FSIZE, (max_file, max_file))
         resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
     return apply
 
 
@@ -48,21 +49,38 @@ def run_python(
     memory_bytes: int = 512 * 1024 * 1024,
     max_file_bytes: int = 1024 * 1024,
 ) -> SandboxResult:
-    with tempfile.TemporaryDirectory(prefix="guardian-") as tmp:
+    # Output goes to files (not pipes) so RLIMIT_FSIZE also caps how much the
+    # child can make the host buffer.
+    with tempfile.TemporaryDirectory(prefix="guardian-") as tmp, \
+            open(os.path.join(tmp, ".out"), "w+b") as out, \
+            open(os.path.join(tmp, ".err"), "w+b") as err:
+        work = os.path.join(tmp, "work")
+        os.mkdir(work, 0o700)
         proc = subprocess.Popen(
             [sys.executable, "-I", "-S", "-c", code],
-            cwd=tmp,
-            env={"PATH": "/usr/bin:/bin", "HOME": tmp},  # no inherited secrets
+            cwd=work,
+            env={"PATH": "/usr/bin:/bin", "HOME": work},  # no inherited secrets
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            stdout=out,
+            stderr=err,
+            close_fds=True,
             preexec_fn=_limits(cpu_seconds, memory_bytes, max_file_bytes),
         )
+        timed_out = False
         try:
-            out, err = proc.communicate(timeout=timeout)
-            return SandboxResult(proc.returncode, out, err, False)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, 9)
-            out, err = proc.communicate()
-            return SandboxResult(-9, out, err, True)
+            timed_out = True
+        finally:
+            try:
+                os.killpg(proc.pid, 9)  # also reaps any grandchildren
+            except ProcessLookupError:
+                pass
+            proc.wait()
+
+        def read(f) -> str:
+            f.seek(0)
+            return f.read(max_file_bytes).decode("utf-8", "replace")
+
+        return SandboxResult(-9 if timed_out else proc.returncode,
+                             read(out), read(err), timed_out)

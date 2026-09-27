@@ -24,11 +24,17 @@
 | External halt file | `killswitch.py` | `touch HALT` from any process stops generation and training. |
 | Dead-man's switch | `killswitch.py` | If operators stop sending heartbeats, the system halts itself. |
 | Per-token interrupt | `runtime.py`, `model/gpt.py` | The kill switch is checked between every generated token. |
-| M-of-N approval | `quorum.py` | High-risk actions need N distinct operator HMAC signatures over the exact action and arguments. Approvals are single-use and expire. |
+| M-of-N approval | `quorum.py` | High-risk actions need N distinct operator Ed25519 signatures over the exact action and arguments. Approvals are single-use (even across restarts), expire, and last at most 1 hour. The host holds only public keys. |
 | Capability policy | `policy.py` | Tools are LOW, HIGH or FORBIDDEN. Unlisted tools are FORBIDDEN. |
 | Budgets | `policy.py` | Hard caps on calls, tokens and wall-clock time. |
 | Output tripwires | `policy.py`, `runtime.py` | A dangerous pattern in output (e.g. private keys) *halts* the system rather than just redacting it. |
-| Tamper-evident audit | `audit.py` | Edits, deletions and reordering of past records are detected. |
+| Tamper-evident audit | `audit.py` | Edits, deletions and reordering of past records are detected. External anchors also catch deletion of the newest records. |
+| Persistent latch | `killswitch.py` | A trip is written to disk, so restarting the process doesn't un-press the button. |
+| Signed heartbeats | `killswitch.py` | Only an operator's signature keeps the dead-man's switch alive. |
+| Watchdog + hard exit | `killswitch.py` | A background thread enforces halts even if the main thread hangs. |
+| Probing detection | `runtime.py` | Repeated policy denials trip the kill switch. |
+| Preflight | `preflight.py` | Serving is refused until a self-test of the live configuration passes. |
+| Deployment gate | `deploy.py`, `model/checkpoint.py` | Only quorum-approved weights that passed evals are served, loaded without running pickled code. |
 | Sandboxed tools | `sandbox.py` | Tools run in a separate process with CPU, memory, file and process limits, a scrubbed environment and a temp working dir. A timeout kills the whole process group. |
 
 ## Required outer layers (deployment, not code)
@@ -39,8 +45,7 @@ The in-process controls assume the host itself is trustworthy. In production:
   with a read-only root filesystem, seccomp, no host mounts and no cloud credentials.
 - **Network:** deny all egress except through an allow-listed, logging proxy.
 - **Key custody:** operator keys stay on hardware tokens held by separate people.
-  They never go on the model host. Replace HMAC with asymmetric signatures
-  (e.g. Ed25519) so the host only holds public keys.
+  They never go on the model host, which holds only public keys.
 - **Out-of-band kill:** keep a power or network cutoff that doesn't depend on
   this software at all (hypervisor stop, network ACL, power cut).
 - **Audit anchoring:** regularly copy `AuditLog.head` to write-once storage
@@ -50,13 +55,14 @@ The in-process controls assume the host itself is trustworthy. In production:
 - **Evaluations before deployment:** run dangerous-capability evals, red-teaming
   and staged rollouts before widening access.
 
+See `RISK_REGISTER.md` for the full list of risks, `OPERATIONS.md` for
+procedures and `UPDATES.md` for how changes are made.
+
 ## Known limitations (read these)
 
-- Output tripwires are pattern-based and easy to evade on purpose (encodings,
-  paraphrase). They catch accidents, not a capable adversary. Pair them with
-  model-based classifiers and human review.
-- The HMAC quorum keys are symmetric. Anyone holding the verifier's key table
-  can forge approvals, so the table must not live where the model can read it.
+- Output tripwires handle common encodings (base64, hex, Unicode tricks), but
+  paraphrase or a custom cipher gets past them. Pair them with model-based
+  `output_monitors` and human review.
 - `resource` limits don't block network access or filesystem reads. That's the
   outer sandbox's job.
 - Nothing here addresses *alignment* of the model itself (deceptive behaviour,
