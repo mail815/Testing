@@ -1,5 +1,0 @@
-__pycache__/
-*.pt
-*.jsonl
-HALT
-.pytest_cache/

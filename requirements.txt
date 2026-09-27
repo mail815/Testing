@@ -1,3 +1,0 @@
-torch>=2.4
-cryptography>=41
-pytest>=8
